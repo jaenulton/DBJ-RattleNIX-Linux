@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""
+DBJ RattleNIX Web Server & WebSocket Bridge.
+Integrated 2-way COFDM Modem and CW/Morse Code Repeater ID Decoder.
+"""
+
+import os
+import sys
+import json
+import time
+import asyncio
+import threading
+import subprocess
+import tempfile
+import numpy as np
+import aiohttp
+from aiohttp import web, WSMsgType
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(BASE_DIR)
+from morse_decoder import MorseDecoder
+import updater
+
+BIN_DIR = os.path.join(BASE_DIR, "bin")
+ENCODE_BIN = os.path.join(BIN_DIR, "encode")
+DECODE_STREAM_BIN = os.path.join(BIN_DIR, "decode_stream")
+STATIC_DIR = os.path.join(BASE_DIR, "web", "static")
+CONFIG_FILE = os.path.expanduser("~/.config/rattlegram_config.json")
+
+SAMPLE_RATE = 48000
+FRAME_SAMPLES = 960  # 20ms at 48000Hz
+BYTES_PER_FRAME = FRAME_SAMPLES * 2  # 16-bit mono = 1920 bytes
+
+class RattlegramCore:
+    def __init__(self):
+        self.loop = None
+        self.callsign = "MYCALL"
+        self.carrier = "1500"
+        self.mapping = "4"
+        self.fancy_header = True
+        self.input_source = "@DEFAULT_SOURCE@"
+        self.output_sink = "@DEFAULT_SINK@"
+
+        self.ws_clients = set()
+        self.decoder_proc = None
+        self.capture_proc = None
+        self.is_running = True
+        self.is_transmitting = False
+
+        self.morse_decoder = MorseDecoder(SAMPLE_RATE, FRAME_SAMPLES)
+        self._fft_buffer = np.zeros(1024, dtype=np.float32)
+        self._fft_window = np.hanning(1024).astype(np.float32)
+        self._last_fft_send = 0.0
+
+        # Real-time URL Click Tracking & Analytics
+        self.tracked_urls = {}  # short_code -> {"target_url": ..., "short_url": ..., "clicks": int}
+        self.url_history_file = os.path.expanduser("~/.config/rattlegram_urls.json")
+        self._load_tracked_urls()
+        self._load_config()
+
+    def _load_tracked_urls(self):
+        try:
+            if os.path.exists(self.url_history_file):
+                with open(self.url_history_file, "r") as f:
+                    self.tracked_urls = json.load(f)
+        except Exception:
+            pass
+
+    def _save_tracked_urls(self):
+        try:
+            os.makedirs(os.path.dirname(self.url_history_file), exist_ok=True)
+            with open(self.url_history_file, "w") as f:
+                json.dump(self.tracked_urls, f, indent=2)
+        except Exception:
+            pass
+
+    def record_short_url(self, short_code, short_url, target_url):
+        if not short_code:
+            return
+        if short_code not in self.tracked_urls:
+            self.tracked_urls[short_code] = {
+                "short_code": short_code,
+                "short_url": short_url,
+                "target_url": target_url,
+                "clicks": 0,
+                "created_at": time.time()
+            }
+            self._save_tracked_urls()
+        return self.tracked_urls[short_code]
+
+    def increment_url_clicks(self, short_code):
+        if short_code in self.tracked_urls:
+            self.tracked_urls[short_code]["clicks"] += 1
+            new_count = self.tracked_urls[short_code]["clicks"]
+            self._save_tracked_urls()
+            self.broadcast_ws({
+                "type": "url_click_update",
+                "short_code": short_code,
+                "short_url": self.tracked_urls[short_code].get("short_url"),
+                "clicks": new_count
+            })
+            return new_count
+        return 0
+
+    def _load_config(self):
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, "r") as f:
+                    cfg = json.load(f)
+                    self.callsign = cfg.get("callsign", self.callsign)
+                    self.carrier = str(cfg.get("carrier", self.carrier))
+                    self.mapping = str(cfg.get("mapping", self.mapping))
+                    self.fancy_header = bool(cfg.get("fancy_header", self.fancy_header))
+                    self.input_source = cfg.get("input_source", self.input_source)
+                    self.output_sink = cfg.get("output_sink", self.output_sink)
+        except Exception:
+            pass
+
+    def _save_config(self):
+        try:
+            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+            with open(CONFIG_FILE, "w") as f:
+                json.dump({
+                    "callsign": self.callsign,
+                    "carrier": self.carrier,
+                    "mapping": self.mapping,
+                    "fancy_header": self.fancy_header,
+                    "input_source": self.input_source,
+                    "output_sink": self.output_sink
+                }, f, indent=2)
+        except Exception:
+            pass
+
+    def start(self, loop):
+        self.loop = loop
+        self._start_rx_engine()
+
+    def get_audio_devices(self):
+        inputs = [{"id": "@DEFAULT_SOURCE@", "name": "Default Microphone (System Default)"}]
+        outputs = [{"id": "@DEFAULT_SINK@", "name": "Default Speaker (System Default)"}]
+        try:
+            res_sources = subprocess.run(["pactl", "list", "short", "sources"], stdout=subprocess.PIPE, text=True, timeout=2)
+            for line in res_sources.stdout.strip().split("\n"):
+                if not line: continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    name = parts[1]
+                    if not name.endswith(".monitor"):
+                        friendly = name.replace("alsa_input.", "").replace("pci-0000_00_1f.3-platform-skl_hda_dsp_generic.", "")
+                        inputs.append({"id": name, "name": friendly})
+
+            res_sinks = subprocess.run(["pactl", "list", "short", "sinks"], stdout=subprocess.PIPE, text=True, timeout=2)
+            for line in res_sinks.stdout.strip().split("\n"):
+                if not line: continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    name = parts[1]
+                    friendly = name.replace("alsa_output.", "").replace("pci-0000_00_1f.3-platform-skl_hda_dsp_generic.", "")
+                    outputs.append({"id": name, "name": friendly})
+        except Exception:
+            pass
+        return inputs, outputs
+
+    def broadcast_ws(self, data):
+        if not self.ws_clients or not self.loop or self.loop.is_closed():
+            return
+        msg = json.dumps(data)
+        for ws in list(self.ws_clients):
+            if not ws.closed:
+                try:
+                    asyncio.run_coroutine_threadsafe(ws.send_str(msg), self.loop)
+                except Exception:
+                    pass
+
+    def _start_rx_engine(self):
+        self._stop_rx_engine()
+        self.is_running = True
+
+        # 1. Start C++ COFDM Decoder Process
+        decode_cmd = [DECODE_STREAM_BIN, str(SAMPLE_RATE), str(self.mapping), "0"]
+        try:
+            self.decoder_proc = subprocess.Popen(
+                decode_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+        except Exception as e:
+            self.broadcast_ws({"type": "system_log", "message": f"Decode engine error: {e}"})
+            return
+
+        # 2. Start Linux Pulse/PipeWire Capture via parec
+        parec_cmd = [
+            "parec",
+            f"--rate={SAMPLE_RATE}",
+            "--channels=1",
+            "--format=s16le",
+            "--latency-msec=20",
+            f"--device={self.input_source}"
+        ]
+        try:
+            self.capture_proc = subprocess.Popen(
+                parec_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0
+            )
+        except Exception as e:
+            self.broadcast_ws({"type": "system_log", "message": f"Audio capture start error: {e}"})
+            return
+
+        threading.Thread(target=self._decoder_reader_thread, daemon=True).start()
+        threading.Thread(target=self._audio_capture_thread, daemon=True).start()
+
+    def _stop_rx_engine(self):
+        self.is_running = False
+        if self.capture_proc:
+            try:
+                self.capture_proc.terminate()
+            except Exception:
+                pass
+            self.capture_proc = None
+
+        if self.decoder_proc:
+            try:
+                self.decoder_proc.stdin.close()
+                self.decoder_proc.terminate()
+            except Exception:
+                pass
+            self.decoder_proc = None
+
+    def _audio_capture_thread(self):
+        proc = self.capture_proc
+        last_meter_send = 0.0
+
+        while self.is_running and proc and proc.poll() is None:
+            if self.is_transmitting:
+                time.sleep(0.04)
+                continue
+
+            try:
+                data = proc.stdout.read(BYTES_PER_FRAME)
+                if not data or len(data) < BYTES_PER_FRAME:
+                    continue
+
+                arr = np.frombuffer(data, dtype=np.int16)
+                peak = float(np.max(np.abs(arr)) / 32768.0)
+
+                # Broadcast live meter level at 25 FPS
+                now = time.time()
+                if now - last_meter_send >= 0.04:
+                    last_meter_send = now
+                    self.broadcast_ws({"type": "audio_level", "level": peak})
+
+                # Feed into CW / Morse Code Decoder
+                cw_words = self.morse_decoder.process_frame(arr)
+                for word in cw_words:
+                    self.broadcast_ws({
+                        "type": "cw_message",
+                        "callsign": "CW ID",
+                        "payload": word
+                    })
+
+                # Stream into Rattlegram COFDM decoder
+                if self.decoder_proc and self.decoder_proc.stdin:
+                    self.decoder_proc.stdin.write(data)
+                    self.decoder_proc.stdin.flush()
+
+                # Stream Spectrum / Waterfall FFT data at ~20-25 FPS
+                if now - self._last_fft_send >= 0.045:
+                    self._last_fft_send = now
+                    # Roll buffer and insert new samples
+                    self._fft_buffer[:-FRAME_SAMPLES] = self._fft_buffer[FRAME_SAMPLES:]
+                    self._fft_buffer[-FRAME_SAMPLES:] = arr.astype(np.float32) / 32768.0
+                    fft_mag = np.abs(np.fft.rfft(self._fft_buffer * self._fft_window))
+                    # Frequency resolution: 48000 / 1024 = 46.875 Hz per bin
+                    # 0 to 4000 Hz corresponds to bins 0 to 86
+                    bins_4k = fft_mag[:86]
+                    # Convert to dB scale [-80dB to 0dB], normalized 0 to 255
+                    db = 20.0 * np.log10(np.maximum(bins_4k, 1e-4))
+                    # Normalize: -75dB -> 0, -10dB -> 255
+                    norm = np.clip((db + 75.0) * (255.0 / 65.0), 0, 255).astype(np.uint8)
+                    self.broadcast_ws({
+                        "type": "fft_frame",
+                        "bins": norm.tolist()
+                    })
+
+            except Exception:
+                break
+
+    def _decoder_reader_thread(self):
+        proc = self.decoder_proc
+        if not proc or not proc.stdout:
+            return
+
+        last_sync_call = ""
+        while self.is_running and proc.poll() is None:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                line_str = line.decode("utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+
+            if not line_str:
+                continue
+
+            if line_str.startswith("EVENT:SYNC"):
+                parts = line_str.split("|")
+                cfo = ""
+                call = ""
+                for p in parts[1:]:
+                    if p.startswith("CFO:"):
+                        cfo = p.split(":")[1]
+                    elif p.startswith("CALL:"):
+                        call = p.split(":", 1)[1].strip()
+                last_sync_call = call
+                self.broadcast_ws({"type": "rx_sync", "callsign": call, "cfo": cfo})
+
+            elif line_str.startswith("EVENT:MESSAGE"):
+                parts = line_str.split("|")
+                flips = 0
+                payload = ""
+                for p in parts[1:]:
+                    if p.startswith("FLIPS:"):
+                        try:
+                            flips = int(p.split(":")[1])
+                        except Exception:
+                            flips = 0
+                    elif p.startswith("PAYLOAD:"):
+                        payload = p.split(":", 1)[1]
+
+                rx_call = last_sync_call or "UNKNOWN"
+                self.broadcast_ws({
+                    "type": "rx_message",
+                    "callsign": rx_call,
+                    "payload": payload,
+                    "flips": flips
+                })
+                last_sync_call = ""
+
+    def transmit(self, message):
+        msg = message.strip()
+        if not msg:
+            return
+
+        callsign = self.callsign.strip() or "N0CALL"
+        if len(msg.encode("utf-8")) > 170:
+            self.broadcast_ws({"type": "system_log", "message": "Payload exceeds 170 bytes limit"})
+            return
+
+        def _worker():
+            self.is_transmitting = True
+            self.broadcast_ws({"type": "tx_started", "callsign": callsign, "payload": msg})
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = tmp.name
+
+            try:
+                cmd = [
+                    ENCODE_BIN,
+                    msg,
+                    callsign,
+                    "1",
+                    str(self.carrier),
+                    str(SAMPLE_RATE),
+                    "16",
+                    "0",
+                    str(self.mapping),
+                    wav_path,
+                    "1" if self.fancy_header else "0"
+                ]
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                if res.returncode != 0:
+                    self.broadcast_ws({"type": "system_log", "message": f"Encode error: {res.stderr.decode()}"})
+                    return
+
+                play_cmd = ["paplay", f"--device={self.output_sink}", wav_path]
+                subprocess.run(play_cmd, check=True)
+
+            except Exception as e:
+                self.broadcast_ws({"type": "system_log", "message": f"TX exception: {e}"})
+            finally:
+                try:
+                    os.remove(wav_path)
+                except Exception:
+                    pass
+                time.sleep(0.1)
+                self.is_transmitting = False
+                self.broadcast_ws({"type": "tx_finished"})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def test_loopback(self):
+        callsign = self.callsign or "LOOP"
+        test_msg = f"TEST LOOPBACK {time.strftime('%H:%M:%S')}"
+        self.broadcast_ws({"type": "system_log", "message": f"Running loopback: {test_msg}..."})
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav_path = tmp.name
+
+        def _worker():
+            try:
+                cmd = [
+                    ENCODE_BIN,
+                    test_msg,
+                    callsign,
+                    "1",
+                    str(self.carrier),
+                    str(SAMPLE_RATE),
+                    "16",
+                    "0",
+                    str(self.mapping),
+                    wav_path,
+                    "1" if self.fancy_header else "0"
+                ]
+                subprocess.run(cmd, check=True)
+                with open(wav_path, "rb") as f:
+                    wav_bytes = f.read()
+
+                pcm = wav_bytes[44:] + b"\x00" * (FRAME_SAMPLES * 2 * 22)
+                if self.decoder_proc and self.decoder_proc.stdin:
+                    self.decoder_proc.stdin.write(pcm)
+                    self.decoder_proc.stdin.flush()
+            except Exception as e:
+                self.broadcast_ws({"type": "system_log", "message": f"Loopback error: {e}"})
+            finally:
+                try:
+                    os.remove(wav_path)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+async def index_handler(request):
+    return web.FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+async def shorten_url_remote(url_to_shorten: str, core: RattlegramCore = None) -> dict:
+    url_to_shorten = url_to_shorten.strip()
+    if not url_to_shorten:
+        return {"error": "URL cannot be empty"}
+    if not url_to_shorten.startswith(("http://", "https://")):
+        url_to_shorten = "https://" + url_to_shorten
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                "https://url.w8jae.com/api/shorten",
+                json={"targetUrl": url_to_shorten},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    short_url = data.get("shortUrl")
+                    short_code = data.get("shortCode", "")
+                    if short_url:
+                        if core:
+                            core.record_short_url(short_code, short_url, url_to_shorten)
+                        return {
+                            "success": True,
+                            "shortUrl": short_url,
+                            "shortCode": short_code,
+                            "targetUrl": url_to_shorten,
+                            "clicks": core.tracked_urls.get(short_code, {}).get("clicks", 0) if core else 0
+                        }
+                    return {"error": "Invalid response from URL shortener service"}
+                else:
+                    return {"error": f"Shortener service returned HTTP {resp.status}"}
+        except Exception as e:
+            return {"error": f"Failed to connect to shortener service: {e}"}
+
+async def track_redirect_handler(request):
+    """
+    Tracking redirector for clicks:
+    When a link or recipient navigates through this tracker endpoint,
+    it records the visit real-time and forwards directly to the target URL.
+    """
+    core = request.app["core"]
+    short_code = request.match_info.get("code", "").strip()
+    info = core.tracked_urls.get(short_code)
+    if info:
+        core.increment_url_clicks(short_code)
+        target = info.get("target_url") or info.get("short_url")
+        raise web.HTTPFound(location=target)
+    raise web.HTTPNotFound(text="Short URL tracking code not found")
+
+async def shorten_webhook_handler(request):
+    """
+    Webhook endpoint to submit a URL and receive the shortened URL from https://url.w8jae.com/.
+    Accepts:
+      - JSON body: {"url": "https://..."} or {"targetUrl": "https://..."}
+      - Form data: url=...
+      - Query params: ?url=...
+    """
+    core = request.app["core"]
+    url_to_shorten = None
+    if request.method == "POST":
+        content_type = request.content_type.lower()
+        if "application/json" in content_type:
+            try:
+                body = await request.json()
+                url_to_shorten = body.get("url") or body.get("targetUrl")
+            except Exception:
+                return web.json_response({"error": "Malformed JSON body"}, status=400)
+        else:
+            try:
+                post_data = await request.post()
+                url_to_shorten = post_data.get("url") or post_data.get("targetUrl")
+            except Exception:
+                pass
+    
+    if not url_to_shorten:
+        url_to_shorten = request.query.get("url") or request.query.get("targetUrl")
+
+    if not url_to_shorten:
+        return web.json_response({"error": "Missing 'url' or 'targetUrl' parameter"}, status=400)
+
+    result = await shorten_url_remote(url_to_shorten, core)
+    status_code = 200 if result.get("success") else 502
+    return web.json_response(result, status=status_code)
+
+async def webhook_click_recorder(request):
+    """
+    Webhook for external hit counter pings from url.w8jae.com or external triggers.
+    Accepts GET or POST: ?code=... or {"code": "..."}
+    """
+    core = request.app["core"]
+    code = request.query.get("code") or request.query.get("short_code")
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            code = body.get("code") or body.get("short_code") or code
+        except Exception:
+            pass
+    if code and code in core.tracked_urls:
+        new_cnt = core.increment_url_clicks(code)
+        return web.json_response({"success": True, "code": code, "clicks": new_cnt})
+    return web.json_response({"error": "Code not found or not provided"}, status=400)
+
+async def websocket_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    core = request.app["core"]
+    core.ws_clients.add(ws)
+
+    inputs, outputs = core.get_audio_devices()
+    await ws.send_str(json.dumps({
+        "type": "devices_list",
+        "inputs": inputs,
+        "outputs": outputs,
+        "current_in": core.input_source,
+        "current_out": core.output_sink
+    }))
+
+    await ws.send_str(json.dumps({
+        "type": "config_state",
+        "callsign": core.callsign,
+        "carrier": core.carrier,
+        "mapping": core.mapping,
+        "fancy_header": core.fancy_header
+    }))
+
+    # Send initial click counts for all tracked URLs
+    await ws.send_str(json.dumps({
+        "type": "url_click_all",
+        "urls": core.tracked_urls
+    }))
+
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                cmd = data.get("cmd")
+                if cmd == "transmit":
+                    core.transmit(data.get("message", ""))
+                elif cmd == "test_loopback":
+                    core.test_loopback()
+                elif cmd == "shorten_url":
+                    target_url = data.get("url", "")
+                    res = await shorten_url_remote(target_url, core)
+                    await ws.send_str(json.dumps({
+                        "type": "shorten_result",
+                        "req_id": data.get("req_id", ""),
+                        **res
+                    }))
+                elif cmd == "record_url_click":
+                    short_code = data.get("short_code", "")
+                    core.increment_url_clicks(short_code)
+                elif cmd == "set_config":
+                    core.callsign = data.get("callsign", core.callsign)
+                    new_carrier = data.get("carrier")
+                    new_mapping = data.get("mapping")
+                    new_in = data.get("input_device")
+                    new_out = data.get("output_device")
+                    if "fancy_header" in data:
+                        core.fancy_header = bool(data["fancy_header"])
+
+                    changed = False
+                    if new_carrier and str(new_carrier) != str(core.carrier):
+                        core.carrier = str(new_carrier)
+                    if new_mapping and str(new_mapping) != str(core.mapping):
+                        core.mapping = str(new_mapping)
+                        changed = True
+                    if new_in and new_in != core.input_source:
+                        core.input_source = new_in
+                        changed = True
+                    if new_out and new_out != core.output_sink:
+                        core.output_sink = new_out
+
+                    core._save_config()
+
+                    if changed:
+                        core._start_rx_engine()
+
+            elif msg.type == WSMsgType.ERROR:
+                pass
+    finally:
+        core.ws_clients.remove(ws)
+
+    return ws
+
+async def check_update_handler(request):
+    """
+    Checks remote version.json against local version.
+    """
+    info = await updater.check_updates(updater.CURRENT_VERSION)
+    return web.json_response(info)
+
+async def apply_update_handler(request):
+    """
+    Downloads and applies the OTA patch in place.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    target_ver = data.get("version")
+    if not target_ver:
+        # Check current available target
+        check_res = await updater.check_updates(updater.CURRENT_VERSION)
+        target_ver = check_res.get("target_version")
+        if not target_ver:
+            return web.json_response({"success": False, "error": "No update target available"}, status=400)
+
+    res = await updater.apply_ota_patch(target_ver, platform_name="linux", app_base_dir=BASE_DIR)
+    return web.json_response(res)
+
+async def on_startup(app):
+    loop = asyncio.get_running_loop()
+    app["core"].start(loop)
+
+async def on_cleanup(app):
+    app["core"]._stop_rx_engine()
+
+def create_app():
+    app = web.Application()
+    core = RattlegramCore()
+    app["core"] = core
+
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+
+    app.router.add_get("/", index_handler)
+    app.router.add_get("/api/shorten", shorten_webhook_handler)
+    app.router.add_post("/api/shorten", shorten_webhook_handler)
+    app.router.add_post("/webhook/shorten", shorten_webhook_handler)
+    app.router.add_get("/webhook/shorten", shorten_webhook_handler)
+    app.router.add_get("/webhook/click", webhook_click_recorder)
+    app.router.add_post("/webhook/click", webhook_click_recorder)
+    app.router.add_get("/r/{code}", track_redirect_handler)
+    app.router.add_get("/api/check_update", check_update_handler)
+    app.router.add_post("/api/apply_update", apply_update_handler)
+    app.router.add_get("/ws", websocket_handler)
+    app.router.add_static("/static/", path=STATIC_DIR, name="static")
+
+    return app
+
+if __name__ == "__main__":
+    app = create_app()
+    web.run_app(app, host="127.0.0.1", port=8998)

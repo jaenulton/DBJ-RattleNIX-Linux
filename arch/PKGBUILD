@@ -1,0 +1,31 @@
+# Maintainer: Jae <jae@devbyjae.com>
+pkgname=dbj-rattlenix
+pkgver=1.12
+pkgrel=1
+pkgdesc="DBJ RattleNIX - Modern COFDM Acoustic Text Modem & CW Decoder"
+arch=('x86_64')
+url="https://devbyjae.com"
+license=('GPL3')
+depends=('python' 'python-numpy' 'python-aiohttp' 'libpulse' 'curl' 'xdg-utils')
+optdepends=('chromium: Dedicated WebApp standalone window mode')
+source=()
+
+package() {
+    install -d "$pkgdir/usr/bin"
+    install -d "$pkgdir/usr/share/applications"
+    install -d "$pkgdir/usr/share/icons/hicolor/scalable/apps"
+    install -d "$pkgdir/usr/share/dbj-rattlenix/bin"
+    install -d "$pkgdir/usr/share/dbj-rattlenix/web/static"
+
+    install -m755 "$startdir/../bin/encode" "$pkgdir/usr/share/dbj-rattlenix/bin/encode"
+    install -m755 "$startdir/../bin/decode_stream" "$pkgdir/usr/share/dbj-rattlenix/bin/decode_stream"
+    install -m755 "$startdir/../bin/decode" "$pkgdir/usr/share/dbj-rattlenix/bin/decode"
+
+    install -m755 "$startdir/../web_server.py" "$pkgdir/usr/share/dbj-rattlenix/web_server.py"
+    install -m755 "$startdir/../updater.py" "$pkgdir/usr/share/dbj-rattlenix/updater.py"
+    install -m644 "$startdir/../morse_decoder.py" "$pkgdir/usr/share/dbj-rattlenix/morse_decoder.py"
+    install -m644 "$startdir/../icon.svg" "$pkgdir/usr/share/dbj-rattlenix/icon.svg"
+
+    cp -r "$startdir/../web/static/"* "$pkgdir/usr/share/dbj-rattlenix/web/static/"
+    install -m644 "$startdir/../icon.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/dbj-rattlenix.svg"
+}

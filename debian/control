@@ -1,0 +1,15 @@
+Package: dbj-rattlenix
+Version: 1.12
+Section: hamradio
+Priority: optional
+Architecture: amd64
+Depends: python3, python3-numpy, python3-aiohttp, pulseaudio-utils | pipewire-pulse, curl, xdg-utils
+Recommends: chromium | chromium-browser | google-chrome-stable | firefox
+Installed-Size: 2800
+Maintainer: Jae <jae@devbyjae.com>
+Homepage: https://devbyjae.com
+Description: DBJ RattleNIX - Modern COFDM Acoustic Text Modem & CW Decoder
+ DBJ RattleNIX is a modern, high-speed acoustic text modem and CW ID decoder
+ for Linux. It supports Ribbit / Rattlegram COFDM acoustic audio packets,
+ 3-way color theming (Dark, Charcoal, Light), OTA self-updating, and
+ real-time vectorized Morse code decoding with a glassmorphic web UI.

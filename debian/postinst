@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+if which update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q || true
+fi
+
+if which gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q /usr/share/icons/hicolor || true
+fi
+
+chmod 755 /usr/share/dbj-rattlenix/bin/* 2>/dev/null || true
+chmod 755 /usr/bin/dbj-rattlenix 2>/dev/null || true
+
+exit 0
