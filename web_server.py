@@ -612,6 +612,7 @@ async def websocket_handler(request):
                         core.output_sink = new_out
 
                     core._save_config()
+                    asyncio.create_task(updater.log_usage_telemetry(core.callsign, platform="linux", version=updater.CURRENT_VERSION))
 
                     if changed:
                         core._start_rx_engine()
@@ -651,7 +652,9 @@ async def apply_update_handler(request):
 
 async def on_startup(app):
     loop = asyncio.get_running_loop()
-    app["core"].start(loop)
+    core = app["core"]
+    core.start(loop)
+    asyncio.create_task(updater.log_usage_telemetry(core.callsign, platform="linux", version=updater.CURRENT_VERSION))
 
 async def on_cleanup(app):
     app["core"]._stop_rx_engine()
