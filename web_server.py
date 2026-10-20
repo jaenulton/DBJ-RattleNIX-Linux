@@ -435,7 +435,11 @@ class RattlegramCore:
         threading.Thread(target=_worker, daemon=True).start()
 
 async def index_handler(request):
-    return web.FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    response = web.FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 async def shorten_url_remote(url_to_shorten: str, core: RattlegramCore = None) -> dict:
     url_to_shorten = url_to_shorten.strip()

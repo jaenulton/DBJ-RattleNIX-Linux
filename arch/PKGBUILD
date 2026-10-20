@@ -1,6 +1,6 @@
 # Maintainer: Jae <jae@devbyjae.com>
 pkgname=dbj-rattlenix
-pkgver=1.14
+pkgver=1.15
 pkgrel=1
 pkgdesc="DBJ RattleNIX - Modern COFDM Acoustic Text Modem & CW Decoder"
 arch=('x86_64')
